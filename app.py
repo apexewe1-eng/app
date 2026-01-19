@@ -1,323 +1,353 @@
+# app.py
 import random
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-import numpy as np
+import time
+import statistics
 import streamlit as st
-from PIL import Image
 
-N = 4
-SIZE = N * N
-EMPTY = 0
-SOLVED_BONUS = 10_000
+from solvers import (
+    GOAL,
+    manhattan,
+    a_star_baseline_metrics,
+    NFSACOSolver,
+    apply_move,
+)
 
+# ---------- Helpers ----------
 
-# ----------------------------
-# Board helpers
-# ----------------------------
-def goal_board() -> List[int]:
-    return list(range(1, SIZE)) + [EMPTY]
-
-
-def is_solved(board: List[int]) -> bool:
-    return board == goal_board()
-
-
-def idx_to_rc(i: int) -> Tuple[int, int]:
-    return i // N, i % N
-
-
-def rc_to_idx(r: int, c: int) -> int:
-    return r * N + c
-
-
-def find_empty(board: List[int]) -> int:
-    return board.index(EMPTY)
-
-
-def neighbors_of_empty(empty_idx: int) -> List[int]:
-    r, c = idx_to_rc(empty_idx)
-    out = []
-    if r > 0:
-        out.append(rc_to_idx(r - 1, c))
-    if r < N - 1:
-        out.append(rc_to_idx(r + 1, c))
-    if c > 0:
-        out.append(rc_to_idx(r, c - 1))
-    if c < N - 1:
-        out.append(rc_to_idx(r, c + 1))
-    return out
-
-
-def swap(board: List[int], i: int, j: int) -> List[int]:
-    b = board[:]
-    b[i], b[j] = b[j], b[i]
-    return b
-
-
-def successors(board: List[int]) -> List[Tuple[int, List[int]]]:
-    """Return list of (tile_index_to_move, next_board)."""
-    e = find_empty(board)
-    return [(t_idx, swap(board, e, t_idx)) for t_idx in neighbors_of_empty(e)]
-
-
-# ----------------------------
-# Solvability (15-puzzle parity)
-# ----------------------------
-def inversion_count(arr: List[int]) -> int:
-    a = [x for x in arr if x != EMPTY]
-    inv = 0
-    for i in range(len(a)):
-        for j in range(i + 1, len(a)):
-            if a[i] > a[j]:
-                inv += 1
-    return inv
-
-
-def is_solvable(board: List[int]) -> bool:
-    # For even width (4):
-    # solvable iff (blankRowFromBottom is even) XOR (inversions is even)
-    inv_even = inversion_count(board) % 2 == 0
-    empty_idx = find_empty(board)
-    r, _ = idx_to_rc(empty_idx)
-    blank_row_from_bottom = N - r  # 1..N
-    blank_even = blank_row_from_bottom % 2 == 0
-    return blank_even != inv_even
-
-
-def shuffled_solvable_board() -> List[int]:
-    base = goal_board()
-    for _ in range(5000):
-        b = base[:]
-        random.shuffle(b)
-        if b != base and is_solvable(b):
-            return b
-    # fallback: random legal moves from goal (always solvable)
-    b = base
-    for _ in range(80):
-        _, b = random.choice(successors(b))
-    return b
-
-
-# ----------------------------
-# Heuristic + utility
-# ----------------------------
-def manhattan(board: List[int]) -> int:
-    s = 0
-    for i, t in enumerate(board):
-        if t == EMPTY:
-            continue
-        goal_idx = t - 1
-        r1, c1 = idx_to_rc(i)
-        r2, c2 = idx_to_rc(goal_idx)
-        s += abs(r1 - r2) + abs(c1 - c2)
+def make_solvable_shuffle(steps: int):
+    s = GOAL
+    for _ in range(steps):
+        moves = []
+        for d in ["Up", "Down", "Left", "Right"]:
+            ns = apply_move(s, d)
+            if ns != s:
+                moves.append(d)
+        s = apply_move(s, random.choice(moves))
     return s
 
+def moved_tile_pos(prev_state, curr_state):
+    if prev_state == curr_state:
+        return None
+    bp = prev_state.index(0)
+    bc = curr_state.index(0)
+    if bp == bc:
+        return None
+    return bp  # moved tile ends at previous blank position
 
-def misplaced(board: List[int]) -> int:
-    m = 0
-    for i, t in enumerate(board):
-        if t == EMPTY:
-            continue
-        if t != i + 1:
-            m += 1
-    return m
+def board_css(tile_px, font_px, gap_px=12):
+    cls = f"puz_{tile_px}_{font_px}"
+    css = f"""
+    <style>
+    .{cls} {{
+        display: grid;
+        grid-template-columns: repeat(3, {tile_px}px);
+        gap: {gap_px}px;
+        padding: {gap_px}px;
+        background: #050914;
+        border-radius: 22px;
+        width: fit-content;
+        border: 2px solid #111827;
+    }}
+    .{cls} .cell {{
+        width: {tile_px}px;
+        height: {tile_px}px;
+        border-radius: 16px;
+        background: #0b1220;
+        border: 3px solid #334155;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: {font_px}px;
+        font-weight: 800;
+        color: #e5e7eb;
+        user-select: none;
+        box-sizing: border-box;
+    }}
+    .{cls} .blank {{
+        border-color: #1f2937;
+        color: transparent;
+    }}
+    .{cls} .moved {{
+        border-color: #22c55e !important;
+        box-shadow: 0 0 0 3px rgba(34,197,94,.25),
+                    0 0 24px rgba(34,197,94,.25);
+    }}
+    </style>
+    """
+    return cls, css
 
+def render_board(state, tile_px, font_px, highlight=None):
+    cls, css = board_css(tile_px, font_px)
+    html = css + f'<div class="{cls}">'
+    for i, v in enumerate(state):
+        extra = " moved" if (highlight == i and v != 0) else ""
+        if v == 0:
+            html += f'<div class="cell blank{extra}">.</div>'
+        else:
+            html += f'<div class="cell{extra}">{v}</div>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
-def utility(board: List[int], depth_remaining: int) -> float:
-    # Higher is better for MAX
-    if is_solved(board):
-        return SOLVED_BONUS + depth_remaining
-    # negate distance so MAX wants larger utility
-    return -(manhattan(board) + 0.25 * misplaced(board))
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
+def winner_text(metric, a_val, n_val, lower_is_better=True):
+    if lower_is_better:
+        if a_val < n_val:
+            return f"🏁 **{metric} winner: A*** (A*={a_val} < NFS-ACO={n_val})"
+        if n_val < a_val:
+            return f"🏁 **{metric} winner: NFS-ACO** (NFS-ACO={n_val} < A*={a_val})"
+        return f"🏁 **{metric}: Tie** (A*={a_val}, NFS-ACO={n_val})"
+    else:
+        if a_val > n_val:
+            return f"🏁 **{metric} winner: A*** (A*={a_val} > NFS-ACO={n_val})"
+        if n_val > a_val:
+            return f"🏁 **{metric} winner: NFS-ACO** (NFS-ACO={n_val} > A*={a_val})"
+        return f"🏁 **{metric}: Tie** (A*={a_val}, NFS-ACO={n_val})"
 
-# ----------------------------
-# Expectiminimax (MAX / CHANCE / MIN)
-# Gremlin (MIN) picks a move that hurts MAX.
-# CHANCE: with prob glitchProb -> MIN acts, else nothing happens.
-# ----------------------------
-@dataclass
-class EIParams:
-    glitch_prob: float
+def safe_mean_std(vals):
+    if not vals:
+        return 0.0, 0.0
+    if len(vals) == 1:
+        return float(vals[0]), 0.0
+    return statistics.mean(vals), statistics.stdev(vals)
 
+def make_frontier_chart_data(a, nfs):
+    # returns list of dict rows for st.line_chart
+    L = max(len(a["frontier_sizes"]), len(nfs["frontier_sizes"]))
+    rows = []
+    for i in range(L):
+        a_y = a["frontier_sizes"][i] if i < len(a["frontier_sizes"]) else a["frontier_sizes"][-1]
+        n_y = nfs["frontier_sizes"][i] if i < len(nfs["frontier_sizes"]) else nfs["frontier_sizes"][-1]
+        rows.append({"expansion_index": i, "A*": a_y, "NFS-ACO": n_y})
+    return rows
 
-def expectiminimax(board: List[int], depth: int, node_type: str, p: EIParams) -> float:
-    if depth == 0 or is_solved(board):
-        return utility(board, depth)
+# ---------- UI ----------
 
-    if node_type == "MAX":
-        best = -float("inf")
-        for _, nb in successors(board):
-            v = expectiminimax(nb, depth - 1, "CHANCE", p)
-            best = max(best, v)
-        return best
+st.set_page_config(page_title="Ganesh Pokharel - 34138027", layout="wide")
+st.markdown("# Ganesh Pokharel - 34138027")
+st.markdown("### **Efficiency Analysis of A* and NFS-ACO search Algorithm**")
+st.divider()
 
-    if node_type == "MIN":
-        best = float("inf")
-        for _, nb in successors(board):
-            v = expectiminimax(nb, depth - 1, "MAX", p)
-            best = min(best, v)
-        return best
+# Controls
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1:
+    shuffle_steps = st.slider("Shuffle", 5, 200, 60)
+with c2:
+    anim_speed = st.slider("Speed (sec/move)", 0.10, 1.50, 0.60, 0.05)
+with c3:
+    tile_px = st.slider("Tile size", 60, 140, 90, 5)
+with c4:
+    font_px = st.slider("Font size", 24, 90, 44, 2)
+with c5:
+    st.write("")
+    gen_btn = st.button("Generate new puzzle")
+    solve_btn = st.button("Solve")
 
-    # CHANCE
-    v_no = expectiminimax(board, depth - 1, "MAX", p)
-    v_glitch = expectiminimax(board, depth - 1, "MIN", p)
-    return (1 - p.glitch_prob) * v_no + p.glitch_prob * v_glitch
+# Session state
+if "start" not in st.session_state:
+    st.session_state.start = make_solvable_shuffle(60)
+if "a" not in st.session_state:
+    st.session_state.a = None
+if "nfs" not in st.session_state:
+    st.session_state.nfs = None
+if "step" not in st.session_state:
+    st.session_state.step = 0
+if "playing" not in st.session_state:
+    st.session_state.playing = False
 
+# Actions
+if gen_btn:
+    st.session_state.start = make_solvable_shuffle(shuffle_steps)
+    st.session_state.a = None
+    st.session_state.nfs = None
+    st.session_state.step = 0
+    st.session_state.playing = False
+    st.rerun()
 
-def best_move(board: List[int], depth: int, p: EIParams) -> Tuple[Optional[int], float]:
-    best_score = -float("inf")
-    best_idx = None
-    for t_idx, nb in successors(board):
-        score = expectiminimax(nb, depth - 1, "CHANCE", p)
-        if score > best_score:
-            best_score = score
-            best_idx = t_idx
-    return best_idx, best_score
+if solve_btn:
+    s = st.session_state.start
+    a = a_star_baseline_metrics(s, GOAL)
+    nfs = NFSACOSolver(GOAL, manhattan(s, GOAL)).solve_metrics(s)
+    st.session_state.a = a
+    st.session_state.nfs = nfs
+    st.session_state.step = 0
+    st.session_state.playing = False
+    st.rerun()
 
+# Playback controls
+if st.session_state.a and st.session_state.nfs:
+    st.divider()
+    a_states = st.session_state.a["states"]
+    n_states = st.session_state.nfs["states"]
+    max_steps = max(len(a_states), len(n_states)) - 1
 
-# ----------------------------
-# Image slicing
-# ----------------------------
-def slice_image(img: Image.Image, tile_px: int = 96) -> List[Image.Image]:
-    # Center-crop to square then resize to NxN tiles
-    w, h = img.size
-    s = min(w, h)
-    left = (w - s) // 2
-    top = (h - s) // 2
-    img = img.crop((left, top, left + s, top + s))
-    img = img.resize((tile_px * N, tile_px * N))
+    p1, p2, p3, p4 = st.columns([1, 1, 1, 3])
+    with p1:
+        if st.button("⏮ Prev"):
+            st.session_state.playing = False
+            st.session_state.step = clamp(st.session_state.step - 1, 0, max_steps)
+            st.rerun()
+    with p2:
+        if st.button("⏭ Next"):
+            st.session_state.playing = False
+            st.session_state.step = clamp(st.session_state.step + 1, 0, max_steps)
+            st.rerun()
+    with p3:
+        if st.session_state.playing:
+            if st.button("⏸ Pause"):
+                st.session_state.playing = False
+                st.rerun()
+        else:
+            if st.button("▶ Play"):
+                st.session_state.playing = True
+                st.rerun()
+    with p4:
+        idx = st.slider("Move", 0, max_steps, st.session_state.step)
+        if idx != st.session_state.step:
+            st.session_state.playing = False
+            st.session_state.step = idx
+            st.rerun()
 
-    tiles = []
-    for r in range(N):
-        for c in range(N):
-            tile = img.crop((c * tile_px, r * tile_px, (c + 1) * tile_px, (r + 1) * tile_px))
-            tiles.append(tile)
-    return tiles  # index corresponds to goal position (tile number t -> tiles[t-1])
+    # autoplay (no autorefresh)
+    if st.session_state.playing:
+        if st.session_state.step < max_steps:
+            time.sleep(anim_speed)
+            st.session_state.step += 1
+            st.rerun()
+        else:
+            st.session_state.playing = False
 
+# Boards
+colA, colN = st.columns(2, gap="large")
+with colA:
+    st.subheader("A*")
+    a_board = st.empty()
+    a_info = st.empty()
+with colN:
+    st.subheader("NFS-ACO")
+    n_board = st.empty()
+    n_info = st.empty()
 
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="4×4 Puzzle + Expectiminimax", layout="centered")
+start = st.session_state.start
 
-st.title("4×4 Sliding Puzzle (Image Upload) + Expectiminimax Hints")
+if not st.session_state.a:
+    with a_board:
+        render_board(start, tile_px, font_px)
+    with n_board:
+        render_board(start, tile_px, font_px)
+    a_info.info("Click **Solve** to compute paths, winners, frontier growth and experiments.")
+    n_info.info("Click **Solve** to compute paths, winners, frontier growth and experiments.")
+else:
+    a = st.session_state.a
+    nfs = st.session_state.nfs
+    i = st.session_state.step
 
-with st.sidebar:
-    st.header("Settings")
-    glitch_prob = st.slider("Glitch probability (chance node)", 0.0, 0.6, 0.2, 0.05)
-    depth = st.slider("Hint search depth", 1, 7, 4, 1)
-    tile_px = st.slider("Tile size (px)", 64, 140, 96, 8)
+    a_states = a["states"]
+    n_states = nfs["states"]
+    ai = min(i, len(a_states) - 1)
+    ni = min(i, len(n_states) - 1)
 
-    st.caption(
-        "Gameplay twist: after your move, with some probability a 'gremlin' (MIN) makes one move that hurts you. "
-        "Hint uses expectiminimax: MAX → CHANCE → MIN."
+    a_hi = moved_tile_pos(a_states[ai - 1], a_states[ai]) if ai > 0 else None
+    n_hi = moved_tile_pos(n_states[ni - 1], n_states[ni]) if ni > 0 else None
+
+    with a_board:
+        render_board(a_states[ai], tile_px, font_px, a_hi)
+    with n_board:
+        render_board(n_states[ni], tile_px, font_px, n_hi)
+
+    a_info.success(
+        f"Steps: {a['steps']} | Time: {a['time_ms']:.3f} ms | "
+        f"Nodes: {a['nodes_expanded']} | Max frontier: {a['max_frontier']} | "
+        f"Visited: {a['visited_count']}"
+    )
+    n_info.success(
+        f"Steps: {nfs['steps']} | Time: {nfs['time_ms']:.3f} ms | "
+        f"Nodes: {nfs['nodes_expanded']} | Max frontier: {nfs['max_frontier']} | "
+        f"Visited: {nfs['visited_count']} | "
+        f"Thermal: {nfs.get('thermal_limit', 0):.2f} | Evap: {nfs.get('evaporation', 0):.3f}"
     )
 
-# session state init
-if "board" not in st.session_state:
-    st.session_state.board = shuffled_solvable_board()
-if "moves" not in st.session_state:
-    st.session_state.moves = 0
-if "tiles" not in st.session_state:
-    st.session_state.tiles = None  # list of PIL tiles or None
+    # Winner banners
+    st.divider()
+    st.subheader("🏁 Winners (per metric)")
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        st.success(winner_text("Time (ms)", round(a["time_ms"], 3), round(nfs["time_ms"], 3), True))
+    with w2:
+        st.success(winner_text("Nodes expanded", a["nodes_expanded"], nfs["nodes_expanded"], True))
+    with w3:
+        st.success(winner_text("Max frontier (space)", a["max_frontier"], nfs["max_frontier"], True))
 
-uploaded = st.file_uploader("Upload an image (optional)", type=["png", "jpg", "jpeg", "webp"])
-if uploaded is not None:
-    img = Image.open(uploaded).convert("RGB")
-    st.session_state.tiles = slice_image(img, tile_px=tile_px)
-    st.image(img, caption="Uploaded image (used as texture)", use_container_width=True)
+    # Frontier growth chart
+    st.divider()
+    st.subheader("🔥 Frontier growth (frontier size as search progresses)")
+    chart_rows = make_frontier_chart_data(a, nfs)
+    st.line_chart(chart_rows, x="expansion_index", y=["A*", "NFS-ACO"])
 
-colA, colB, colC = st.columns(3)
-with colA:
-    if st.button("Shuffle"):
-        st.session_state.board = shuffled_solvable_board()
-        st.session_state.moves = 0
-with colB:
-    if st.button("Reset to Goal"):
-        st.session_state.board = goal_board()
-        st.session_state.moves = 0
-with colC:
-    if st.button("Hint (Expectiminimax)"):
-        t_idx, score = best_move(st.session_state.board, depth, EIParams(glitch_prob))
-        st.session_state.hint_idx = t_idx
-        st.toast(f"Hint: move tile at index {t_idx} (score {score:.2f})")
+# ---------- Multi-run experiment mode ----------
+st.divider()
+st.subheader("📊 Multi-run average plots (research mode)")
 
-hint_idx = st.session_state.get("hint_idx", None)
+e1, e2, e3 = st.columns([1.3, 2.2, 1.3])
+with e1:
+    trials = st.slider("Trials per difficulty", 3, 50, 10)
+with e2:
+    depths = st.multiselect(
+        "Shuffle difficulties",
+        [20, 40, 60, 80, 100, 120, 150, 180, 200],
+        default=[40, 60, 100, 150]
+    )
+with e3:
+    run_exp = st.button("Run experiment")
 
-board = st.session_state.board
-moves = st.session_state.moves
+if run_exp and depths:
+    rows = []
 
-st.subheader(f"Moves: {moves}")
-if is_solved(board):
-    st.success("Solved! 🎉")
-else:
-    st.info(f"Manhattan distance: {manhattan(board)}")
+    for d in depths:
+        a_times, a_nodes, a_space = [], [], []
+        n_times, n_nodes, n_space = [], [], []
 
-# Render grid:
-# Each cell shows the tile image/number and a Move button if it can slide into empty.
-empty_idx = find_empty(board)
-legal = set(neighbors_of_empty(empty_idx))
+        for _ in range(trials):
+            s = make_solvable_shuffle(d)
+            a = a_star_baseline_metrics(s, GOAL)
+            nfs = NFSACOSolver(GOAL, manhattan(s, GOAL)).solve_metrics(s)
 
-# Optional: show the recommended tile highlight
-def cell_border(i: int) -> str:
-    if hint_idx is not None and i == hint_idx:
-        return "border: 4px solid #2ea44f; border-radius: 12px; padding: 6px;"
-    return "border: 1px solid #ddd; border-radius: 12px; padding: 6px;"
+            a_times.append(a["time_ms"])
+            a_nodes.append(a["nodes_expanded"])
+            a_space.append(a["max_frontier"])
 
-# UI grid
-for r in range(N):
-    cols = st.columns(N)
-    for c in range(N):
-        i = rc_to_idx(r, c)
-        t = board[i]
-        with cols[c]:
-            st.markdown(f"<div style='{cell_border(i)}'>", unsafe_allow_html=True)
+            n_times.append(nfs["time_ms"])
+            n_nodes.append(nfs["nodes_expanded"])
+            n_space.append(nfs["max_frontier"])
 
-            if t == EMPTY:
-                st.markdown(
-                    f"<div style='height:{tile_px}px; display:flex; align-items:center; justify-content:center; "
-                    f"background:#fafafa; border-radius:12px; color:#777;'>empty</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                if st.session_state.tiles is not None:
-                    st.image(st.session_state.tiles[t - 1], use_container_width=True)
-                else:
-                    st.markdown(
-                        f"<div style='height:{tile_px}px; display:flex; align-items:center; justify-content:center; "
-                        f"font-size:28px; font-weight:700; background:#f3f3f3; border-radius:12px;'>{t}</div>",
-                        unsafe_allow_html=True,
-                    )
+        a_tm, a_ts = safe_mean_std(a_times)
+        a_nm, a_ns = safe_mean_std(a_nodes)
+        a_sm, a_ss = safe_mean_std(a_space)
 
-            can_move = (i in legal) and (not is_solved(board))
-            if st.button("Move", key=f"move_{i}", disabled=not can_move):
-                # Player move: swap tile i with empty
-                next_board = swap(board, i, empty_idx)
-                st.session_state.board = next_board
-                st.session_state.moves += 1
-                st.session_state.hint_idx = None  # clear hint after move
+        n_tm, n_ts = safe_mean_std(n_times)
+        n_nm, n_ns = safe_mean_std(n_nodes)
+        n_sm, n_ss = safe_mean_std(n_space)
 
-                # CHANCE event: glitch -> gremlin makes one bad move
-                if (not is_solved(next_board)) and random.random() < glitch_prob:
-                    succ = successors(next_board)
-                    # Gremlin chooses successor with lowest utility for MAX
-                    worst_u = float("inf")
-                    pick = next_board
-                    for _, nb in succ:
-                        u = utility(nb, 0)
-                        if u < worst_u:
-                            worst_u = u
-                            pick = nb
-                    st.session_state.board = pick
-                    st.toast("⚠️ Glitch! Gremlin moved one tile.", icon="⚠️")
+        rows.append({
+            "shuffle": d,
+            "A*_time_mean(ms)": a_tm, "A*_time_std": a_ts,
+            "A*_nodes_mean": a_nm, "A*_nodes_std": a_ns,
+            "A*_space_mean(max_frontier)": a_sm, "A*_space_std": a_ss,
+            "NFS_time_mean(ms)": n_tm, "NFS_time_std": n_ts,
+            "NFS_nodes_mean": n_nm, "NFS_nodes_std": n_ns,
+            "NFS_space_mean(max_frontier)": n_sm, "NFS_space_std": n_ss,
+        })
 
-                st.rerun()
+    st.write("**Experiment summary (mean ± std)**")
+    st.dataframe(rows, use_container_width=True)
 
-            st.markdown("</div>", unsafe_allow_html=True)
+    # Charts (no matplotlib)
+    st.subheader("Average time vs difficulty")
+    st.line_chart(rows, x="shuffle", y=["A*_time_mean(ms)", "NFS_time_mean(ms)"])
 
-st.caption(
-    "Tip: If you set glitch probability to 0%, it becomes a normal deterministic 15-puzzle. "
-    "With glitches on, the hint is genuinely 'best in expectation' (expectiminimax)."
-)
+    st.subheader("Average nodes expanded vs difficulty")
+    st.line_chart(rows, x="shuffle", y=["A*_nodes_mean", "NFS_nodes_mean"])
+
+    st.subheader("Average space (max frontier) vs difficulty")
+    st.line_chart(rows, x="shuffle", y=["A*_space_mean(max_frontier)", "NFS_space_mean(max_frontier)"])
