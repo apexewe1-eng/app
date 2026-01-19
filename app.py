@@ -3,6 +3,15 @@ import random
 import time
 import statistics
 import streamlit as st
+st.set_page_config(layout="wide")
+
+# 🔒 Hide Streamlit header, GitHub button, and footer
+st.markdown("""
+    <style>
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+""", unsafe_allow_html=True)
 
 from solvers import (
     GOAL,
