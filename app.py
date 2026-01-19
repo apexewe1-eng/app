@@ -135,7 +135,8 @@ def make_frontier_chart_data(a, nfs):
 
 st.set_page_config(page_title="Ganesh Pokharel - 34138027", layout="wide")
 st.markdown("# Ganesh Pokharel - 34138027")
-st.markdown("### **Efficiency Analysis of A* and NFS-ACO search Algorithm**")
+st.markdown("# Artificial Intelligence - CP70069E")
+st.markdown("### **Efficiency Analysis of A*** ** and NFS-ACO search Algorithm**")
 st.divider()
 
 # Controls
